@@ -696,6 +696,9 @@ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     if (sync_context.decode_buffer != nullptr) {
         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
     }
+    if (this->player_impl_->listener != nullptr) {
+        this->player_impl_->listener->on_stream_clear();
+    }
     this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CLEAR);
 }
 

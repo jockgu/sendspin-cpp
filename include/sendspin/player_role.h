@@ -71,8 +71,8 @@ struct ServerCommandMessage {
 
 /// @brief Listener for player role events
 ///
-/// THREAD SAFETY: on_audio_write() fires on the sync task's background thread.
-/// Implementations must be thread-safe for this method. on_stream_start(), on_stream_end(),
+/// THREAD SAFETY: on_audio_write() and on_stream_clear() fire on the sync task's background
+/// thread. Implementations must be thread-safe for these methods. on_stream_start(), on_stream_end(),
 /// on_volume_changed(), on_mute_changed(), and on_static_delay_changed()
 /// fire on the main loop thread via drain_events(). The listener must outlive the role.
 class PlayerRoleListener {
@@ -90,6 +90,12 @@ public:
     /// counts played frames from this value, so a mid-frame count drifts the playtime estimate
     /// and starts the next write mid-frame.
     virtual size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) = 0;
+
+    /// @brief Discards audio already queued in the platform output after a stream/clear (seek)
+    ///
+    /// Fires on the sync task's background thread after its pre-seek decoded PCM is discarded and
+    /// before it writes post-seek PCM. It must be fast and thread-safe.
+    virtual void on_stream_clear() {}
 
     /// @brief Called when a new audio stream starts. Fires on the main loop thread
     virtual void on_stream_start() {}

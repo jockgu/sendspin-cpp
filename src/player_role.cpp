@@ -318,7 +318,6 @@ void PlayerRole::Impl::handle_stream_clear() const {
     // the sync task to discard buffered audio, then enqueue a marker so it knows exactly where the
     // discarded (pre-seek) audio ends and the new audio begins. The flag is set before the marker
     // so the sync task starts draining (freeing ring-buffer space) before we write the marker.
-    // No listener callback: a seek is not a stream lifecycle event for the consumer.
     this->sync_task->signal_stream_clear();
     if (!this->sync_task->write_audio_chunk(nullptr, 0, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER,
                                             HEADER_SEND_TIMEOUT_MS)) {

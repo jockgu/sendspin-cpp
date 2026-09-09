@@ -27,6 +27,7 @@ add_executable(sendspin_tests
     test_network_info.cpp
     test_spsc_ring_buffer.cpp
     test_inbox.cpp
+    test_sync_task.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
 )
