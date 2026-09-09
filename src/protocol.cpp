@@ -893,13 +893,15 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
-    root["payload"]["state"] = to_cstr(msg->state);
+    root["payload"]["available"] = (msg->state != SendspinClientState::EXTERNAL_SOURCE);
 
     if (msg->player.has_value()) {
         const ClientPlayerStateObject& player_state = msg->player.value();
         root["payload"]["player"]["volume"] = player_state.volume;
         root["payload"]["player"]["muted"] = player_state.muted;
         root["payload"]["player"]["static_delay_ms"] = player_state.static_delay_ms;
+        root["payload"]["player"]["required_lead_time_ms"] = player_state.required_lead_time_ms;
+        root["payload"]["player"]["min_buffer_ms"] = player_state.min_buffer_ms;
         if (!player_state.supported_commands.empty()) {
             JsonArray commands_list =
                 root["payload"]["player"]["supported_commands"].to<JsonArray>();
