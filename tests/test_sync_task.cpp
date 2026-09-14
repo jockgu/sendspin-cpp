@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "player_role_impl.h"
+#include "protocol_messages.h"
 
 #include <gtest/gtest.h>
 
@@ -54,6 +55,21 @@ TEST(SyncTask, StreamClearCallsListenerBetweenAudioWrites) {
     listener.on_audio_write(nullptr, 0, 0);
 
     EXPECT_EQ(listener.events, (std::vector<char>{'W', 'C', 'W'}));
+}
+
+TEST(PlayerRole, AdvertisesConfiguredBufferingRequirements) {
+    PlayerRoleConfig config;
+    config.audio_formats = {{SendspinCodecFormat::PCM, 2, 48000, 16}};
+    config.required_lead_time_ms = 250;
+    config.min_buffer_ms = 1000;
+    PlayerRole::Impl player(std::move(config), nullptr, nullptr);
+    ClientStateMessage message;
+
+    player.build_state_fields(message);
+
+    ASSERT_TRUE(message.player.has_value());
+    EXPECT_EQ(message.player->required_lead_time_ms, 250);
+    EXPECT_EQ(message.player->min_buffer_ms, 1000);
 }
 
 }  // namespace

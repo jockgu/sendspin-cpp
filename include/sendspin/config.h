@@ -131,6 +131,15 @@ struct PlayerRoleConfig {
     int32_t fixed_delay_us{0};
     uint16_t initial_static_delay_ms{0};
 
+    /// @brief Minimum time by which audio must lead its presentation timestamp.
+    /// Advertised to the server in client/state; 0 leaves lead-time selection to the server.
+    uint16_t required_lead_time_ms{0};
+
+    /// @brief Minimum ongoing audio buffer requested from the server.
+    /// This is particularly important for live sources, whose delivery jitter must be absorbed
+    /// before audio reaches the local render FIFO. 0 leaves buffering selection to the server.
+    uint16_t min_buffer_ms{0};
+
     /// @brief Default extra silence (ms) inserted at stream start for decode-pipeline headroom
     static constexpr uint16_t DEFAULT_EXTRA_STARTUP_SILENCE_MS = 50U;
 
