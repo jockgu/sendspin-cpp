@@ -32,7 +32,7 @@ namespace sendspin {
 // ============================================================================
 
 /// @brief Configuration for a SendspinClient instance
-/// Filled in by the platform (e.g., ESPHome) before calling start_server()
+/// Filled in by the platform (e.g., ESPHome) before calling start()
 struct SendspinClientConfig {
     /// Unique client identifier. When left empty, the library falls back to the detected local
     /// network interface MAC address (the same value used for device_info.mac_address).
@@ -85,6 +85,11 @@ struct SendspinClientConfig {
     int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
+
+    /// @brief Milliseconds of inbound silence before the established connection is dropped as
+    /// dead. Unset derives it from the time burst settings, tolerating two consecutive unanswered
+    /// time messages (60000 with the defaults); 0 disables.
+    std::optional<int64_t> liveness_timeout_ms{};
 
     /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer
     /// (ESP-IDF only; ignored on host). Defaults to PREFER_EXTERNAL (SPIRAM).

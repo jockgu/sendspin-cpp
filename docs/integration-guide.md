@@ -51,7 +51,7 @@ SendspinClient client(std::move(config));
 
 ## Step 2: Add Roles
 
-Add only the roles your application needs. All roles must be added before calling `start_server()`.
+Add only the roles your application needs. All roles must be added before calling `start()`.
 
 ### Player Role (Audio Playback)
 
@@ -121,7 +121,7 @@ The slot/channel number for each entry is its position (index) in `preferred_for
 
 ### Visualizer Role (Audio Visualization)
 
-Receives real-time beat, loudness, peak frequency, onset, and spectrum data synchronized to playback.
+Receives real-time beat, loudness, dominant-frequency, onset, and spectrum data synchronized to playback.
 
 ```cpp
 VisualizerSupportObject vis_support;
@@ -143,6 +143,23 @@ vis_support.spectrum = VisualizerSpectrumConfig{
 
 auto& visualizer = client.add_visualizer({.support = vis_support});
 ```
+
+The advertised support object is the starting format. To change it at runtime, call
+`request_format()` with only the fields you want to change; omitted fields keep their
+current value on the server:
+
+```cpp
+visualizer.request_format({.rate_max = 15});  // Halve the frame rate
+
+visualizer.request_format({
+    .types = {{VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS}},
+});
+```
+
+While a stream is active the server replies with a fresh `stream/start`, so
+`on_visualizer_stream_start()` fires again with the updated
+`ServerVisualizerStreamObject`. If no stream is active, the server remembers the request
+and applies it to the next stream.
 
 ### Color Role (Audio-Derived Color Palette)
 
@@ -482,7 +499,7 @@ struct MyClientListener : SendspinClientListener {
 
 ## Step 5: Wire Everything Together
 
-Listeners and providers are set as raw pointers. They must outlive the client.
+Listeners and providers are set as raw pointers. They must stay alive for as long as the client can call them: until `stop()` returns, or until the client is destroyed if `stop()` is never called. The destructor itself never invokes a listener (see [Stopping and Restarting](#stopping-and-restarting)).
 
 ```cpp
 MyPlayerListener player_listener;
@@ -503,9 +520,10 @@ client.set_persistence_provider(&persistence_provider); // Optional
 ## Step 6: Start and Run
 
 ```cpp
-// Start the WebSocket server and sync task.
+// Start the role threads and arm the WebSocket server (it comes up on the first loop() tick
+// after the network provider reports ready).
 // Task priorities and PSRAM settings are taken from SendspinClientConfig.
-if (!client.start_server()) {
+if (!client.start()) {
     // Handle failure
     return 1;
 }
@@ -520,9 +538,29 @@ while (running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// Clean shutdown
-client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+// Clean shutdown: goodbye every peer, tear everything down, deliver the clear callbacks.
+client.stop();
 ```
+
+`start_server()` is a deprecated alias of `start()`.
+
+## Stopping and Restarting
+
+`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer, waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
+
+Restarting is `start()` again; start, stop, and start again can be repeated indefinitely, and a restarted client begins with no connection, no group state, and no role state from before the stop.
+
+`stop()` may block, but the wait is bounded. Besides the goodbye bound it includes:
+
+- The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
+- An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
+- A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
+
+Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
+
+`on_request_high_performance()` and `on_release_high_performance()` can fire while the client holds an internal lock, so their bodies must only toggle the platform networking mode and must not call any client or role method.
+
+Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no teardown or clear callback. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
 ## Sending Commands
 
@@ -553,8 +591,6 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 ```
 
 Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
-
-> **Deprecated:** the earlier positional overload `send_command(cmd, volume, mute)` still works but cannot carry seek parameters and will be removed in v0.8.0. Migrate to the struct form above.
 
 ## Accessing Roles
 
@@ -683,7 +719,7 @@ int main() {
     player.set_listener(&player_listener);
     client.set_network_provider(&network);
 
-    client.start_server();
+    client.start();
 
     while (true) {
         client.loop();
@@ -767,6 +803,7 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
+| `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. `0` disables the check. |
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 
@@ -946,10 +983,11 @@ These represent commands the server can send to the player. The player advertise
 
 | Value | Description |
 |---|---|
-| `BEAT` | Beat detection events |
-| `LOUDNESS` | Loudness level |
-| `F_PEAK` | Peak frequency |
-| `SPECTRUM` | Frequency spectrum bins |
+| `BEAT` | Musical beat events from tempo/beat tracking |
+| `LOUDNESS` | Overall loudness level |
+| `F_PEAK` | Dominant frequency and its amplitude |
+| `SPECTRUM` | Full frequency spectrum bins |
+| `PEAK` | Energy onset (transient) events |
 
 ### VisualizerSpectrumScale
 

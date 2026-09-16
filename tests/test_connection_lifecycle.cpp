@@ -19,14 +19,14 @@
 // property or the delivery-at-upgrade contract (connections reach the manager only after their
 // WebSocket upgrade; raw-TCP junk is closed inside the transport layer and never occupies a slot).
 
-#include "connection_manager.h"  // fnv1_hash for the last-played preference
+#include "connection_manager.h"  // fnv1_hash, resolve_liveness_timeout_ms
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "test_support.h"
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketServer.h>
-
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -37,11 +37,13 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
+using namespace sendspin;        // NOLINT(google-build-using-namespace): test-local convenience
+using namespace sendspin::test;  // NOLINT(google-build-using-namespace): shared loopback scaffolding
 
 namespace {
 
@@ -56,31 +58,9 @@ constexpr uint16_t EVICT_TEST_PORT = 18972;
 constexpr uint16_t REJECT_TEST_PORT = 18973;
 constexpr uint16_t STALL_LISTEN_PORT = 18981;
 constexpr uint16_t ADMIT_TEST_PORT = 18982;
-
-std::string server_url(uint16_t port) {
-    return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
-}
-
-std::string server_hello_json(const std::string& server_id, const std::string& reason) {
-    return std::string(R"({"type":"server/hello","payload":{"server_id":")") + server_id +
-           R"(","name":"Fake Server","version":1,"active_roles":["player"],)" +
-           R"("connection_reason":")" + reason + R"("}})";
-}
-
-SendspinClientConfig make_config(uint16_t port) {
-    SendspinClientConfig config;
-    config.client_id = "lifecycle-test-client";
-    config.name = "Lifecycle Test Client";
-    config.server_port = port;
-    return config;
-}
-
-class TestNetworkProvider : public SendspinNetworkProvider {
-public:
-    bool is_network_ready() override {
-        return true;
-    }
-};
+constexpr uint16_t LIVENESS_TEST_PORT = 18983;
+constexpr uint16_t LIVENESS_CONTROL_PORT = 18984;
+constexpr uint16_t LIVENESS_DISABLED_PORT = 18985;
 
 class TestPersistenceProvider : public SendspinPersistenceProvider {
 public:
@@ -94,24 +74,6 @@ private:
     uint32_t hash_;
 };
 
-/// Pumps client.loop() (like a platform main loop would) until the predicate returns true or the
-/// timeout elapses. Returns true if the predicate was satisfied.
-bool pump_until(SendspinClient& client, const std::function<bool()>& pred, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        client.loop();
-        if (pred()) {
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    return false;
-}
-
-void pump_for(SendspinClient& client, int duration_ms) {
-    pump_until(
-        client, [] { return false; }, duration_ms);
-}
 
 int connect_loopback(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -144,69 +106,6 @@ bool socket_closed(int fd) {
         // n > 0: bytes to discard; loop and look again
     }
 }
-
-/// Behavior knobs for FakeServer.
-struct FakeServerOptions {
-    bool hello_on_open{false};  ///< Send server/hello immediately on Open, before any
-                                ///< client/hello arrives (a nonconforming peer)
-    bool answer_hello{true};    ///< Reply to client/hello with server/hello (false: mute peer
-                                ///< that upgrades and then never establishes)
-};
-
-/// A minimal Sendspin "server": an IXWebSocket client that connects to the SendspinClient's WS
-/// server (the server-initiated discovery direction) and answers client/hello with server/hello,
-/// per the given options.
-class FakeServer {
-public:
-    FakeServer(const std::string& url, std::string server_id, FakeServerOptions options = {})
-        : server_id_(std::move(server_id)) {
-        this->ws_.setUrl(url);
-        this->ws_.disableAutomaticReconnection();
-        this->ws_.setOnMessageCallback([this, options](const ix::WebSocketMessagePtr& msg) {
-            if (msg->type == ix::WebSocketMessageType::Open) {
-                if (options.hello_on_open) {
-                    this->ws_.send(server_hello_json(this->server_id_, "discovery"));
-                }
-            } else if (msg->type == ix::WebSocketMessageType::Message &&
-                       msg->str.find("client/hello") != std::string::npos) {
-                this->got_client_hello_.store(true);
-                if (options.answer_hello) {
-                    this->ws_.send(server_hello_json(this->server_id_, "discovery"));
-                }
-            } else if (msg->type == ix::WebSocketMessageType::Message &&
-                       msg->str.find("client/goodbye") != std::string::npos) {
-                this->got_goodbye_.store(true);
-            } else if (msg->type == ix::WebSocketMessageType::Close ||
-                       msg->type == ix::WebSocketMessageType::Error) {
-                this->closed_.store(true);
-            }
-        });
-        this->ws_.start();
-    }
-
-    ~FakeServer() {
-        this->ws_.stop();
-    }
-
-    bool closed() const {
-        return this->closed_.load();
-    }
-
-    bool got_client_hello() const {
-        return this->got_client_hello_.load();
-    }
-
-    bool got_goodbye() const {
-        return this->got_goodbye_.load();
-    }
-
-private:
-    ix::WebSocket ws_;
-    std::string server_id_;
-    std::atomic<bool> closed_{false};
-    std::atomic<bool> got_client_hello_{false};
-    std::atomic<bool> got_goodbye_{false};
-};
 
 /// TCP relay that accepts one connection, sits on it without reading for delay_ms (the peer's
 /// WebSocket upgrade request waits in the kernel buffer), then connects to the backend and pumps
@@ -346,9 +245,8 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     TestNetworkProvider network;
     SendspinClient client(make_config(PROBE_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
-    // The WS server starts synchronously on the first loop() once the network reports ready.
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     // Hold a raw TCP connection open without ever speaking WebSocket.
     int probe_fd = connect_loopback(PROBE_TEST_PORT);
@@ -360,8 +258,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     // A real server connects while the probe is held: it must establish promptly, not after the
     // probe's deadline.
     FakeServer real_server(server_url(PROBE_TEST_PORT), "server-a");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-a");
@@ -369,8 +266,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     // The probe never completes a WebSocket handshake, so the transport layer closes it without
     // it ever reaching the manager (host: IXWebSocket's 3 s server-side handshake timeout; on
     // ESP the ws_server tick would reap it at 5 s). Budget covers either bound plus margin.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return socket_closed(probe_fd); }, 6500));
+    pump_until(client, [&] { return socket_closed(probe_fd); });
     ::close(probe_fd);
 
     // The established connection must have been untouched by the probe reap.
@@ -409,18 +305,14 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
     TestNetworkProvider network;
     SendspinClient client(make_config(OUTBOUND_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     client.connect_to(server_url(PROXY_LISTEN_PORT));
 
-    // Nothing can establish before the proxy forwards the upgrade at ~8 s; the connection must
-    // still be alive past the 5 s mark, well beyond any inbound-side upgrade deadline.
-    EXPECT_FALSE(pump_until(
-        client, [&] { return client.is_connected(); }, 6500));
-
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 7500));
+    // The proxy holds the upgrade for 8 s, past any inbound-side upgrade deadline; the outbound
+    // tier must ride that out and still establish.
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-slow");
@@ -452,20 +344,18 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     TestNetworkProvider network;
     SendspinClient client(make_config(ADMIT_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     client.connect_to(server_url(STALL_LISTEN_PORT));
 
     // A mute inbound peer occupies one inbound slot past TCP_OPEN.
     FakeServer mute(server_url(ADMIT_TEST_PORT), "mute", {.answer_hello = false});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return mute.got_client_hello(); }, 3000));
+    pump_until(client, [&] { return mute.got_client_hello(); });
 
     // The real server takes the second inbound slot; the stalled outbound must not consume it.
     FakeServer real_server(server_url(ADMIT_TEST_PORT), "server-real");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-real");
@@ -484,12 +374,11 @@ TEST(ConnectionLifecycle, EarlyServerHelloDoesNotWedge) {
     TestNetworkProvider network;
     SendspinClient client(make_config(EARLY_HELLO_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     FakeServer eager(server_url(EARLY_HELLO_TEST_PORT), "server-eager", {.hello_on_open = true});
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-eager");
@@ -506,34 +395,27 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     SendspinClient client(make_config(RACE_TEST_PORT));
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     // server-a establishes and is promoted into the empty slot first...
     FakeServer server_a(server_url(RACE_TEST_PORT), "server-a");
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            auto info = client.get_server_information();
-            return info.has_value() && info->server_id == "server-a";
-        },
-        3000));
+    pump_until(client, [&] {
+        auto info = client.get_server_information();
+        return info.has_value() && info->server_id == "server-a";
+    });
 
     // ...then server-b establishes against the incumbent. Both sides of the comparison are
     // established; the last-played preference (server-b) must win the handoff, and the later
     // arrival must not be evicted for finishing second.
     FakeServer server_b(server_url(RACE_TEST_PORT), "server-b");
-    EXPECT_TRUE(pump_until(
-        client,
-        [&] {
-            auto info = client.get_server_information();
-            return info.has_value() && info->server_id == "server-b";
-        },
-        3000));
+    pump_until(client, [&] {
+        auto info = client.get_server_information();
+        return info.has_value() && info->server_id == "server-b";
+    });
 
     // The displaced incumbent is released with a goodbye, not left dangling.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server_a.closed(); }, 3000));
+    pump_until(client, [&] { return server_a.closed(); });
     EXPECT_FALSE(server_b.closed());
     EXPECT_TRUE(client.is_connected());
 }
@@ -544,8 +426,8 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     TestNetworkProvider network;
     SendspinClient client(make_config(EVICT_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     // Two held raw probes, enough to fill every nursery slot if they were admitted at accept.
     int probe1 = connect_loopback(EVICT_TEST_PORT);
@@ -558,15 +440,13 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     // The real server must establish promptly: the probes hold no nursery slots, so nothing
     // needs evicting and nothing is rejected.
     FakeServer real_server(server_url(EVICT_TEST_PORT), "server-real");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-real");
 
     // The transport layer closes the probes on its own (host: IX 3 s handshake timeout).
-    EXPECT_TRUE(pump_until(
-        client, [&] { return socket_closed(probe1) && socket_closed(probe2); }, 6500));
+    pump_until(client, [&] { return socket_closed(probe1) && socket_closed(probe2); });
     EXPECT_TRUE(client.is_connected());
 
     ::close(probe1);
@@ -580,21 +460,117 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     TestNetworkProvider network;
     SendspinClient client(make_config(REJECT_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     // Two mute peers: they upgrade and receive client/hello but never answer it, occupying both
     // nursery slots past TCP_OPEN until the establish deadline.
     FakeServer mute_a(server_url(REJECT_TEST_PORT), "mute-a", {.answer_hello = false});
     FakeServer mute_b(server_url(REJECT_TEST_PORT), "mute-b", {.answer_hello = false});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return mute_a.got_client_hello() && mute_b.got_client_hello(); }, 3000));
+    pump_until(client, [&] { return mute_a.got_client_hello() && mute_b.got_client_hello(); });
 
     FakeServer late(server_url(REJECT_TEST_PORT), "server-late");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return late.closed(); }, 3000));
+    pump_until(client, [&] { return late.closed(); });
     EXPECT_TRUE(late.got_goodbye());
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());
     EXPECT_FALSE(mute_b.closed());
+}
+
+// The derived liveness timeout tracks the configured burst settings, not their defaults.
+TEST(LivenessTimeout, DerivedFromConfiguredBurstSettings) {
+    SendspinClientConfig config;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 60000);
+
+    config.time_burst_interval_ms = 60000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 210000);
+
+    config.time_burst_interval_ms = 10000;
+    config.time_burst_response_timeout_ms = 20000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 90000);
+}
+
+TEST(LivenessTimeout, ExplicitValueUsedAsGiven) {
+    SendspinClientConfig config;
+    config.time_burst_interval_ms = 60000;
+    config.liveness_timeout_ms = 5000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 5000);
+    config.liveness_timeout_ms = 0;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 0);
+}
+
+// An established peer that stops answering without closing is dropped with a restart goodbye.
+// Waiting for client/time proves the peer was admitted, so the drop is not a nursery reap.
+TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_TEST_PORT);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 300;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer silent(server_url(LIVENESS_TEST_PORT), "server-silent", {.answer_time = false});
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return silent.got_client_time(); });
+
+    pump_until(client, [&] { return !client.is_connected(); });
+    pump_until(client, [&] { return silent.closed(); });
+    EXPECT_TRUE(silent.got_goodbye());
+    EXPECT_NE(silent.goodbye_message().find(R"("reason":"restart")"), std::string::npos)
+        << "goodbye: " << silent.goodbye_message();
+    EXPECT_FALSE(client.get_server_information().has_value());
+}
+
+// Control for the test above: a peer that answers time messages stays current past the timeout.
+TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_CONTROL_PORT);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 300;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer live(server_url(LIVENESS_CONTROL_PORT), "server-live", {.answer_time = true});
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return live.got_client_time(); });
+
+    pump_for(client, 1200);  // Four liveness windows
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(live.closed());
+    EXPECT_FALSE(live.got_goodbye());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// liveness_timeout_ms = 0 disables the check: a peer that never answers stays current. Guards the
+// `liveness_timeout_us_ > 0` gate, without which a zero timeout drops every connection at once.
+TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_DISABLED_PORT);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 0;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer silent(server_url(LIVENESS_DISABLED_PORT), "server-silent", {.answer_time = false});
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return silent.got_client_time(); });
+
+    pump_for(client, 300);  // Several time messages go unanswered
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(silent.closed());
+    EXPECT_FALSE(silent.got_goodbye());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
 }
