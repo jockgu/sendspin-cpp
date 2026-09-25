@@ -142,7 +142,7 @@ struct PlayerRole::Impl {
     // on_stream_end() from firing without a matching on_stream_start()
     bool stream_active{false};
     std::atomic<bool> static_delay_adjustable{false};
-    uint8_t volume{0};
+    uint8_t volume{100};
 };
 
 }  // namespace sendspin

@@ -72,5 +72,25 @@ TEST(PlayerRole, AdvertisesConfiguredBufferingRequirements) {
     EXPECT_EQ(message.player->min_buffer_ms, 1000);
 }
 
+TEST(PlayerRole, AdvertisesVolumeCommandsOnlyInHelloCapabilities) {
+    PlayerRoleConfig config;
+    config.audio_formats = {{SendspinCodecFormat::PCM, 2, 48000, 16}};
+    PlayerRole::Impl player(std::move(config), nullptr, nullptr);
+
+    ClientHelloMessage hello;
+    player.build_hello_fields(hello);
+
+    ASSERT_TRUE(hello.player_v1_support.has_value());
+    EXPECT_EQ(hello.player_v1_support->supported_commands,
+              (std::vector<SendspinPlayerCommand>{SendspinPlayerCommand::VOLUME,
+                                                  SendspinPlayerCommand::MUTE}));
+
+    ClientStateMessage state;
+    player.build_state_fields(state);
+
+    ASSERT_TRUE(state.player.has_value());
+    EXPECT_TRUE(state.player->supported_commands.empty());
+}
+
 }  // namespace
 }  // namespace sendspin

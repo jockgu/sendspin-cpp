@@ -229,6 +229,8 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     player_state.required_lead_time_ms = this->config.required_lead_time_ms;
     player_state.min_buffer_ms = this->config.min_buffer_ms;
     if (adjustable) {
+        // Volume and mute are advertised in player@v1_support during client/hello. This
+        // state-level list is reserved for commands that can change with player state.
         player_state.supported_commands = {SendspinPlayerCommand::SET_STATIC_DELAY};
     }
     msg.player = player_state;
